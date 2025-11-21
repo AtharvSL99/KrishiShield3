@@ -57,16 +57,50 @@ def get_market_coordinates():
         return {}
 
 @st.cache_data
-def get_baseline_price(commodity):
-    """Calculates the historical average price to use as a constant baseline."""
+def get_seasonal_baseline(commodity, market_name, target_month):
+    """
+    Calculates the historical average price with hierarchical fallback:
+    1. Specific Market + Specific Month (Best)
+    2. Specific Market + All Year (Good)
+    3. All Markets + Specific Month (Okay - captures seasonality)
+    4. Global Average (Fallback)
+    """
     file_to_load = PRIMARY_DATA_FILE if os.path.exists(PRIMARY_DATA_FILE) else FALLBACK_DATA_FILE
     try:
         df = pd.read_csv(file_to_load, index_col=False)
         df.columns = df.columns.str.strip()
-        # Filter by commodity
-        df = df[df['Commodity'] == commodity]
-        # Return mean Modal Price
-        return df['Modal_Price'].mean()
+        
+        # Clean up market names for matching
+        if 'Market Name' in df.columns:
+            df['Market Name'] = df['Market Name'].astype(str).str.strip().str.lower()
+        target_market = str(market_name).strip().lower()
+        
+        # Standardize Date
+        date_col = 'Price Date' if 'Price Date' in df.columns else 'Date'
+        if date_col in df.columns:
+            df[date_col] = pd.to_datetime(df[date_col])
+            
+            # Filter by Commodity
+            df_com = df[df['Commodity'] == commodity]
+            
+            # Level 1: Market + Month
+            df_market = df_com[df_com['Market Name'] == target_market]
+            df_market_month = df_market[df_market[date_col].dt.month == target_month]
+            
+            if not df_market_month.empty:
+                return df_market_month['Modal_Price'].mean()
+            
+            # Level 2: Market Only (All Year)
+            if not df_market.empty:
+                return df_market['Modal_Price'].mean()
+            
+            # Level 3: Month Only (All Markets - Seasonality)
+            df_month = df_com[df_com[date_col].dt.month == target_month]
+            if not df_month.empty:
+                return df_month['Modal_Price'].mean()
+            
+        # Level 4: Global Average
+        return df[df['Commodity'] == commodity]['Modal_Price'].mean()
     except:
         return 2500.0 # Safe fallback
 
@@ -90,50 +124,98 @@ def load_artifacts():
     except FileNotFoundError:
         return None, None
 
-# --- 2. Real-Time Weather API ---
+# --- 2. Hybrid Data Fetching (CSV + API) ---
 
-def fetch_live_weather(lat, lon, target_date, lookback_days=40):
-    """Fetches daily weather history from Open-Meteo."""
-    end_date_str = target_date.strftime('%Y-%m-%d')
-    start_date_str = (target_date - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
-    
+def load_historical_weather_from_csv(market_name):
+    """Loads weather history directly from the static CSV file."""
+    file_to_load = PRIMARY_DATA_FILE if os.path.exists(PRIMARY_DATA_FILE) else FALLBACK_DATA_FILE
+    try:
+        df = pd.read_csv(file_to_load, index_col=False)
+        df.columns = df.columns.str.strip()
+        
+        # Filter Market
+        df = df[df['Market Name'].astype(str).str.strip() == market_name.strip()]
+        
+        # Date Index
+        date_col = 'Price Date' if 'Price Date' in df.columns else 'Date'
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.set_index(date_col).sort_index()
+        
+        # Select Weather Cols
+        w_cols = ['temperature_2m_max', 'temperature_2m_min', 'temperature_2m_mean',
+                  'precipitation_sum', 'precipitation_hours', 'wind_speed_10m_max', 'weather_code']
+        
+        # Return only existing columns
+        existing = [c for c in w_cols if c in df.columns]
+        return df[existing]
+    except:
+        return pd.DataFrame()
+
+def fetch_api_weather(lat, lon, start_date, end_date):
+    """Fetches weather from Open-Meteo for gaps not covered by CSV."""
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
         "longitude": lon,
-        "start_date": start_date_str,
-        "end_date": end_date_str,
+        "start_date": start_date.strftime('%Y-%m-%d'),
+        "end_date": end_date.strftime('%Y-%m-%d'),
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum,precipitation_hours,wind_speed_10m_max",
         "timezone": "auto"
     }
-    
     try:
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
-        
-        daily_data = data.get('daily', {})
-        df_weather = pd.DataFrame(daily_data)
-        if not df_weather.empty:
-            df_weather['time'] = pd.to_datetime(df_weather['time'])
-            df_weather = df_weather.set_index('time')
-            df_weather.index.name = 'Date'
-        
-        return df_weather
+        daily = pd.DataFrame(data.get('daily', {}))
+        if not daily.empty:
+            daily['time'] = pd.to_datetime(daily['time'])
+            daily = daily.set_index('time')
+        return daily
     except Exception as e:
-        st.error(f"Weather API Error: {e}")
+        st.error(f"API Error: {e}")
         return pd.DataFrame()
 
-# --- 3. Processing Logic (Risk Calculation) ---
+def get_hybrid_weather_data(market_name, lat, lon, target_date, lookback_days=45):
+    """
+    Intelligent Data Fetcher:
+    1. Tries to get data from CSV (semifinal.csv) first.
+    2. If CSV doesn't cover the target date (e.g., it's too new), uses API.
+    """
+    end_date = pd.Timestamp(target_date)
+    start_date = end_date - timedelta(days=lookback_days)
+    
+    # 1. Get CSV Data
+    df_csv = load_historical_weather_from_csv(market_name)
+    
+    # Check coverage
+    csv_covers_window = False
+    if not df_csv.empty:
+        csv_max_date = df_csv.index.max()
+        csv_min_date = df_csv.index.min()
+        
+        # If our requested window is entirely inside the CSV's range
+        if csv_min_date <= start_date and csv_max_date >= end_date:
+            # Use CSV slice
+            return df_csv[(df_csv.index >= start_date) & (df_csv.index <= end_date)], "Historical CSV"
+        
+        # Partial coverage or gap?
+        if end_date > csv_max_date:
+            # We need data from API for recent dates
+            pass 
+
+    # 2. Use API (Fallback or for New Dates)
+    st.caption(f"Date {target_date} outside CSV range. Switching to Live API.")
+    df_api = fetch_api_weather(lat, lon, start_date, end_date)
+    return df_api, "Open-Meteo API"
+
+# --- 3. Processing Logic ---
 
 def process_weather_risk(df_weather, baseline_price):
-    """
-    Aggregates weather data and injects CONSTANT baseline price.
-    """
-    # 1. Add Constant Price Column
+    """Aggregates weather data and injects seasonal baseline price."""
+    # Add Baseline Price
     df_weather['Modal_Price'] = baseline_price
     
-    # 2. Weekly Aggregation
+    # Weekly Aggregation
     agg_rules = {
         'temperature_2m_max': 'max',
         'temperature_2m_min': 'min',
@@ -142,17 +224,17 @@ def process_weather_risk(df_weather, baseline_price):
         'precipitation_hours': 'sum',
         'wind_speed_10m_max': 'mean',
         'weather_code': lambda x: x.mode()[0] if not x.empty else 0,
-        'Modal_Price': 'mean' # Will remain constant
+        'Modal_Price': 'mean' 
     }
     
-    # Ensure columns exist
+    # Fill missing cols
     for col in agg_rules:
         if col not in df_weather.columns:
             df_weather[col] = 0 if col != 'Modal_Price' else baseline_price
 
     df_weekly = df_weather.resample('W').agg(agg_rules)
     
-    # 3. Create Lags (Get Last LAG_WINDOW weeks)
+    # Create Lags
     recent_weeks = df_weekly.tail(LAG_WINDOW).iloc[::-1] 
     
     simulated_data = []
@@ -160,7 +242,7 @@ def process_weather_risk(df_weather, baseline_price):
         row = recent_weeks.iloc[i]
         simulated_data.append({
             'Week_Ending_Date': recent_weeks.index[i].strftime('%Y-%m-%d'),
-            f'{PRICE_COLUMN}_Lag1': row['Modal_Price'], # Constant Baseline
+            f'{PRICE_COLUMN}_Lag1': row['Modal_Price'],
             'temperature_2m_max': row['temperature_2m_max'],
             'precipitation_sum': row['precipitation_sum'],
             'weather_code': row['weather_code'],
@@ -170,7 +252,7 @@ def process_weather_risk(df_weather, baseline_price):
             'precipitation_hours': row['precipitation_hours'],
         })
         
-    # Pad if needed
+    # Pad
     while len(simulated_data) < LAG_WINDOW:
         simulated_data.append(simulated_data[-1] if simulated_data else {})
         
@@ -186,10 +268,8 @@ def prepare_input_features(simulated_data, model_features, baseline_price):
                    'wind_speed_10m_max', 'precipitation_sum', 'precipitation_hours', 'weather_code']:
             if col in data:
                 X_pred.loc[0, f'{col}_Lag{lag}'] = data[col]
-        # Always use baseline for lags
         X_pred.loc[0, f'{PRICE_COLUMN}_Lag{lag}'] = baseline_price
 
-    # Current Week Proxy
     if simulated_data:
         proxy = simulated_data[0]
         for col in ['temperature_2m_mean', 'temperature_2m_max', 'temperature_2m_min', 
@@ -219,19 +299,24 @@ def main():
     markets = sorted(df_base['Market Name'].unique())
     market = st.sidebar.selectbox("Select Market", markets)
     
-    # Calculate Baseline
-    baseline_price = get_baseline_price(DEFAULT_COMMODITY)
-    st.sidebar.markdown(f"**Historical Average Price:** ₹{baseline_price:,.0f}")
-    
     min_date = date(2020, 1, 1) 
     max_date = date(2026, 12, 31)
     prediction_date = st.sidebar.date_input("Assessment Date", date.today(), min_value=min_date, max_value=max_date)
+    
+    # --- Updated Baseline Call ---
+    target_month_name = prediction_date.strftime('%B')
+    # Now passing 'market' to get localized baseline
+    baseline_price = get_seasonal_baseline(DEFAULT_COMMODITY, market, prediction_date.month)
+    
+    st.sidebar.divider()
+    st.sidebar.markdown(f"**Baseline ({market}, {target_month_name}):**")
+    st.sidebar.markdown(f"# ₹{baseline_price:,.0f}")
+    st.sidebar.caption("Average historical price for this specific market and month.")
     
     st.divider()
     
     if st.button("Calculate Risk Factor", type="primary"):
         if market not in market_coords:
-            # Fuzzy match logic
             clean_market = market.strip()
             found_key = next((k for k in market_coords.keys() if str(k).strip() == clean_market), None)
             if found_key:
@@ -242,12 +327,12 @@ def main():
         else:
             lat, lon = market_coords[market]['latitude_x'], market_coords[market]['longitude_x']
 
-        with st.spinner("Analyzing weather patterns..."):
-            # Fetch ONLY weather
-            df_weather = fetch_live_weather(lat, lon, prediction_date)
+        with st.spinner("Fetching weather data..."):
+            # Hybrid Fetch: Decides between CSV and API
+            df_weather, source = get_hybrid_weather_data(market, lat, lon, prediction_date)
             
             if not df_weather.empty:
-                # Process with CONSTANT baseline price
+                # Process
                 simulated_data = process_weather_risk(df_weather, baseline_price)
                 
                 # Predict
@@ -256,22 +341,19 @@ def main():
                 X_scaled = scaler.transform(X_input)
                 predicted_price = model.predict(X_scaled)[0]
                 
-                # --- RISK CALCULATION ---
-                # Logic: If model predicts Price >> Baseline, it implies weather is forcing price up (Supply Constraint/Bad Weather)
+                # --- Risk Metrics ---
                 deviation = predicted_price - baseline_price
                 pct_change = (deviation / baseline_price) * 100
                 
-                # Risk Score (0 to 100)
-                # 0% change = Risk 20 (Normal)
-                # +50% change = Risk 90 (High)
-                # -20% change = Risk 10 (Low/Bumper)
-                risk_score = min(max((pct_change + 20) * 1.5, 0), 100)
+                # Risk Score: Amplifies deviations. +20% price = High Risk.
+                risk_score = min(max((pct_change + 10) * 2.5, 0), 100)
                 
                 col1, col2, col3 = st.columns(3)
                 
-                col1.metric("Projected Price Impact", f"₹ {predicted_price:,.0f}", delta=f"{pct_change:.1f}% vs Avg")
+                col1.metric("Projected Price Impact", f"₹ {predicted_price:,.0f}", 
+                           delta=f"{pct_change:.1f}% vs Baseline", delta_color="inverse")
                 
-                # Visual Risk Display
+                # Visuals
                 if risk_score > 60:
                     risk_label = "HIGH RISK (Adverse Weather)"
                     risk_color = "red"
@@ -287,15 +369,17 @@ def main():
                 col2.progress(int(risk_score) / 100)
                 
                 col3.info(f"""
-                **Logic:** The model predicts price based **only** on recent weather, assuming a starting price of ₹{baseline_price:,.0f}.
+                **Data Source:** {source}
                 
-                Higher predicted prices indicate weather patterns historically associated with crop damage or supply shortages.
+                **Analysis:**
+                The model analyzed weather patterns for the 4 weeks ending on **{prediction_date}**.
+                Comparing against the historical **{market}** average in **{target_month_name}** (₹{baseline_price:,.0f}).
                 """)
                 
-                with st.expander("See Weather Data Used"):
+                with st.expander("View Weather Data Used"):
                     st.dataframe(pd.DataFrame(simulated_data))
             else:
-                st.error("Could not fetch weather data.")
+                st.error("Could not fetch weather data (Check CSV dates or API connection).")
 
 if __name__ == "__main__":
     main()
