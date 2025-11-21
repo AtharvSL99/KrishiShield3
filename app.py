@@ -109,10 +109,7 @@ def load_artifacts(commodity_name):
 # --- 2. ROBUST Caching System ---
 
 def update_weather_cache(new_data, lat, lon):
-    """
-    Safely updates the cache by reading the old file, merging, and overwriting.
-    Prevents CSV corruption from blind appending.
-    """
+    """Safely updates the cache."""
     try:
         df_new = new_data.copy()
         df_new['lat'] = round(lat, 4)
@@ -121,14 +118,10 @@ def update_weather_cache(new_data, lat, lon):
         if os.path.exists(CACHE_FILE):
             try:
                 df_old = pd.read_csv(CACHE_FILE, index_col='Date', parse_dates=True)
-                # Combine old and new
                 df_combined = pd.concat([df_old, df_new])
-                # Remove duplicates based on index (Date) and Location
-                # We reset index to include Date in duplicate check
                 df_combined = df_combined.reset_index().drop_duplicates(subset=['Date', 'lat', 'lon'], keep='last').set_index('Date')
                 df_combined.to_csv(CACHE_FILE)
             except Exception:
-                # If read failed (corrupt file), just overwrite
                 df_new.to_csv(CACHE_FILE)
         else:
             df_new.to_csv(CACHE_FILE)
@@ -136,17 +129,12 @@ def update_weather_cache(new_data, lat, lon):
         print(f"Cache Write Error: {e}")
 
 def load_weather_from_cache(lat, lon, start_date, end_date):
-    """
-    Retrieves data from cache. 
-    Fallback: If exact date range missing, returns MOST RECENT data for that location.
-    """
+    """Retrieves data from cache."""
     if not os.path.exists(CACHE_FILE):
         return pd.DataFrame(), "Cache Empty"
     
     try:
         df = pd.read_csv(CACHE_FILE, index_col='Date', parse_dates=True)
-        
-        # Filter by Location (approximate match)
         lat_mask = (df['lat'] >= lat - 0.1) & (df['lat'] <= lat + 0.1)
         lon_mask = (df['lon'] >= lon - 0.1) & (df['lon'] <= lon + 0.1)
         df_loc = df[lat_mask & lon_mask].copy()
@@ -154,15 +142,12 @@ def load_weather_from_cache(lat, lon, start_date, end_date):
         if df_loc.empty:
             return pd.DataFrame(), "No Data for Location"
             
-        # 1. Try Exact Range
         mask_date = (df_loc.index >= pd.Timestamp(start_date)) & (df_loc.index <= pd.Timestamp(end_date))
         df_range = df_loc[mask_date]
         
         if not df_range.empty and (df_range.index.max() - df_range.index.min()).days >= 20:
              return df_range.sort_index().drop(columns=['lat', 'lon']), "Offline Cache (Exact)"
              
-        # 2. Fallback: Get the most recent 25 days available
-        # This allows "Stale" data usage if offline
         df_loc = df_loc.sort_index()
         last_date = df_loc.index.max()
         fallback_start = last_date - timedelta(days=25)
@@ -176,9 +161,7 @@ def load_weather_from_cache(lat, lon, start_date, end_date):
 # --- 3. Fetch Logic ---
 
 def fetch_unified_weather(lat, lon):
-    """
-    Fetches weather data. Tries Online first, falls back to Cache.
-    """
+    """Fetches weather data. Tries Online first, falls back to Cache."""
     today = date.today()
     start_date = today - timedelta(days=7)
     end_date = today + timedelta(days=16)
@@ -190,30 +173,25 @@ def fetch_unified_weather(lat, lon):
         "timezone": "auto", "past_days": 7, "forecast_days": 16
     }
     
-    # 1. Try Online
     try:
-        r = requests.get(url, params=params, timeout=3) # Fast timeout
+        r = requests.get(url, params=params, timeout=3)
         r.raise_for_status()
         data = r.json()
         daily_data = data.get('daily', {})
         df = pd.DataFrame(daily_data)
-        
         if not df.empty:
             df['Date'] = pd.to_datetime(df['time'])
             df = df.set_index('Date').drop(columns=['time'])
-            # Save to Cache
             update_weather_cache(df, lat, lon)
             return df, "Open-Meteo API (Live)"
     except Exception:
-        pass # Fail silently to offline mode
+        pass 
         
-    # 2. Try Cache
     st.warning("⚠️ Internet unreachable. Switching to Offline Mode.")
     df_cache, status_msg = load_weather_from_cache(lat, lon, start_date, end_date)
     
     if not df_cache.empty:
         return df_cache, status_msg
-        
     return pd.DataFrame(), status_msg
 
 # --- 4. Scenario Builder ---
@@ -221,7 +199,6 @@ def fetch_unified_weather(lat, lon):
 def build_hybrid_scenario(df_api, historical_avgs):
     """Stitches API data with historical projections."""
     df_scenario = df_api.copy()
-    
     last_api_date = df_scenario.index.max()
     start_date = df_scenario.index.min()
     current_duration = (last_api_date - start_date).days
@@ -236,7 +213,6 @@ def build_hybrid_scenario(df_api, historical_avgs):
             row['Date'] = current_date
             projection_rows.append(row)
             current_date += timedelta(days=1)
-            
         df_proj = pd.DataFrame(projection_rows).set_index('Date')
         df_scenario = pd.concat([df_scenario, df_proj])
     
@@ -251,13 +227,10 @@ def aggregate_to_weekly_lags(df_daily):
         'weather_code': lambda x: x.mode()[0] if not x.empty else 0,
         'Modal_Price': 'mean' 
     }
-    
     for col in agg_rules:
         if col not in df_daily.columns: df_daily[col] = 0
-            
     df_weekly = df_daily.resample('7D', origin='start').agg(agg_rules)
     df_weekly = df_weekly.iloc[:LAG_WINDOW]
-    
     while len(df_weekly) < LAG_WINDOW:
         last_row = df_weekly.iloc[[-1]].copy()
         last_row.index = last_row.index + timedelta(days=7)
@@ -297,6 +270,45 @@ def prepare_input_features(simulated_data, model_features, baseline_price):
             if col in X_pred.columns and col in proxy: X_pred.loc[0, col] = proxy[col]
     return X_pred
 
+# --- 5. Advisory Logic ---
+
+def get_advisory(risk_label, crop_name):
+    """Returns specific advice based on the calculated risk level."""
+    if "HIGH" in risk_label:
+        return {
+            "title": f"🚨 Critical Advisory for {crop_name}",
+            "body": f"The model predicts high price volatility (>25% above norm), likely driven by **adverse weather conditions** (such as heavy rain or heat stress) forecasted for the growing period. This indicates a high risk of crop damage or supply shortage.",
+            "steps": [
+                "**Delay Planting:** If heavy rain is forecast within the next 10 days, postpone sowing to prevent seed washout.",
+                "**Drainage Check:** Ensure field drainage systems are clear to handle potential excess precipitation.",
+                "**Crop Insurance:** Verify your coverage specifically for weather-related yield loss.",
+                "**Input Management:** Hold off on applying expensive fertilizers until the weather stabilizes to avoid leaching."
+            ],
+            "color": "error"
+        }
+    elif "MODERATE" in risk_label:
+        return {
+            "title": f"⚠️ Cautionary Advisory for {crop_name}",
+            "body": f"Conditions are deviating from the historical norm. Moderate stress on the crop is expected, with prices projected to be slightly elevated.",
+            "steps": [
+                "**Monitor Closely:** Increase frequency of field inspections for early signs of stress or pests.",
+                "**Irrigation:** Manage water carefully; avoid over-irrigation if rain forecasts are erratic.",
+                "**Nutrients:** Consider applying micronutrients or biostimulants to boost plant immunity against minor stress."
+            ],
+            "color": "warning"
+        }
+    else:
+        return {
+            "title": f"✅ Favorable Advisory for {crop_name}",
+            "body": f"Weather forecasts align well with historical norms. Conditions are favorable for a standard or high yield.",
+            "steps": [
+                "**Maximize Yield:** Focus on standard agronomic practices (weeding, timely fertilization) to capitalize on good weather.",
+                "**Market Strategy:** Good weather often leads to higher supply and stable prices. Plan your storage or post-harvest logistics early.",
+                "**Routine Care:** Stick to the standard crop calendar."
+            ],
+            "color": "success"
+        }
+
 # --- Main App ---
 
 def main():
@@ -308,7 +320,6 @@ def main():
         st.error("System Error: Missing Data File (semifinal.csv or test.csv).")
         st.stop()
         
-    # Sidebar
     st.sidebar.header("Crop Selection")
     available_crops = ["Onion", "Wheat", "Potato"]
     selected_crop = st.sidebar.selectbox("Select Crop", available_crops)
@@ -324,14 +335,12 @@ def main():
     market = st.sidebar.selectbox("Select Market", valid_markets)
     model, scaler = load_artifacts(selected_crop)
     
-    # Cache Inspector Sidebar
     if st.sidebar.checkbox("Show Cache Status"):
         if os.path.exists(CACHE_FILE):
             st.sidebar.success("Cache File Exists")
             try:
                 c_df = pd.read_csv(CACHE_FILE)
                 st.sidebar.write(f"Entries: {len(c_df)}")
-                st.sidebar.dataframe(c_df.tail(3))
             except: st.sidebar.error("Cache Corrupt")
         else:
             st.sidebar.warning("Cache Empty")
@@ -401,6 +410,23 @@ def main():
                     col2.markdown(f"<h2 style='color:{risk_color}'>{risk_label}</h2>", unsafe_allow_html=True)
                     col2.progress(int(risk_score) / 100)
                     col3.info(f"**Source:** {source_status}\n\n{risk_desc}")
+                    
+                    # --- Advisory Window ---
+                    st.divider()
+                    advisory = get_advisory(risk_label, selected_crop)
+                    
+                    if advisory['color'] == 'error':
+                        display_box = st.error
+                    elif advisory['color'] == 'warning':
+                        display_box = st.warning
+                    else:
+                        display_box = st.success
+                        
+                    with display_box(advisory['title']):
+                        st.write(advisory['body'])
+                        st.markdown("#### Recommended Actions:")
+                        for step in advisory['steps']:
+                            st.markdown(f"- {step}")
                     
                     st.subheader("Data Timeline")
                     st.dataframe(pd.DataFrame(simulated_data)[['Week_Start', 'temperature_2m_max', 'precipitation_sum', 'weather_code']], use_container_width=True)
