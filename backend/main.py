@@ -1,4 +1,9 @@
+import os
+from dotenv import load_dotenv
+from twilio.rest import Client # NEW: Missing Import
 from fastapi import FastAPI, HTTPException
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -7,11 +12,19 @@ import numpy as np
 import pickle
 import xgboost as xgb
 import requests
-import os
 import json
 import random
 from datetime import datetime, timedelta, date
 
+# Load variables from .env file
+load_dotenv()
+
+# --- TWILIO CREDENTIALS ---
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+TWILIO_SMS_NUMBER = os.getenv('TWILIO_SMS_NUMBER')
+TWILIO_WA_NUMBER = os.getenv('TWILIO_WA_NUMBER')
+FARMER_PHONE_NUMBER = os.getenv('FARMER_PHONE_NUMBER')
 
 app = FastAPI()
 
@@ -48,14 +61,23 @@ else:
 
 # --- 3. HELPER FUNCTIONS ---
 
+# --- 3. HELPER FUNCTIONS ---
+
 def load_model_and_scaler(crop):
     try:
         with open(f"{crop}.pkl", 'rb') as f:
             model = pickle.load(f)
             if isinstance(model, xgb.XGBRegressor):
                 model.set_params(device='cpu', tree_method='hist')
+        
         with open(f"{crop.lower()}_scaler.pkl", 'rb') as f:
             scaler = pickle.load(f)
+        
+        # FIX: This prevents the 'InconsistentVersionWarning' from crashing 
+        # the prediction when using different scikit-learn versions.
+        if hasattr(scaler, "clip_") and not hasattr(scaler, "feature_names_in_"):
+            scaler.clip_ = None
+            
         return model, scaler
     except Exception as e:
         print(f"Error loading model for {crop}: {e}")
@@ -85,6 +107,29 @@ def fetch_weather_data(lat, lon):
     except Exception:
         pass 
     return pd.DataFrame(), "Weather Unavailable"
+
+def send_notification(message_body):
+    """Sends both SMS and WhatsApp via Twilio."""
+    try:
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        
+        # Send SMS
+        client.messages.create(
+            body=message_body,
+            from_=TWILIO_SMS_NUMBER,
+            to=FARMER_PHONE_NUMBER
+        )
+        
+        # Send WhatsApp
+        client.messages.create(
+            body=message_body,
+            from_=f"whatsapp:{TWILIO_WA_NUMBER}",
+            to=f"whatsapp:{FARMER_PHONE_NUMBER}"
+        )
+        return True
+    except Exception as e:
+        print(f"Twilio Error: {e}")
+        return False
 
 def get_seasonal_averages(crop):
     filename = f"{crop.lower()}_market_lagged_features.csv"
@@ -180,16 +225,22 @@ def monitor_risks():
             pct_change = ((pred - last_price) / last_price) * 100
             
             # Threshold: > 10% deviation
+            # Threshold: > 10% deviation
             if abs(pct_change) > 10:
-                print(f"!!! ALERT TRIGGERED: {crop} in {market} changed by {pct_change:.1f}%")
+                print(f"!!! ALERT TRIGGERED: {crop} in {market}")
+                
+                msg_text = f"Price Alert: {crop} in {market} is projected to reach ₹{int(pred)} (Change: {pct_change:.1f}%)."
+                
+                # TRIGGER ACTUAL NOTIFICATION
+                sms_status = send_notification(msg_text)
                 
                 alert_obj = {
                     "type": "Critical" if abs(pct_change) > 20 else "Warning",
                     "crop": crop,
                     "market": market,
-                    "message": f"Significant price shift detected! Changed from ₹{int(last_price)} to ₹{int(pred)}.",
+                    "message": msg_text,
                     "change_pct": round(pct_change, 1),
-                    "is_sms_sent": True
+                    "is_sms_sent": sms_status # Now reflects actual success
                 }
                 save_alert(alert_obj)
             
