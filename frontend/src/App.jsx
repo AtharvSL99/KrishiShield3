@@ -218,7 +218,7 @@ function App() {
       {/* Sidebar */}
       <aside className={`sidebar ${isSidebarOpen ? 'open' : ''}`}>
         <div className="sidebar-header">
-          <h2><img src="/Krishi.png" alt="Krishi Shield Logo" style={{width: '24px', height: '24px', marginRight: '8px', verticalAlign: 'middle'}} /> Krishi Shield</h2>
+          <h2><img src="/Krishi.png" alt="Krishi Shield Logo" style={{width: '50px', height: '50px', marginRight: '8px', verticalAlign: 'middle'}} /> Krishi Shield</h2>
           <button className="close-btn" onClick={() => setIsSidebarOpen(false)}><X size={24} /></button>
         </div>
         <div className="form-group">
