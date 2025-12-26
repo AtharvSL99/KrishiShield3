@@ -1,234 +1,316 @@
-
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-import os
-from datetime import datetime, timedelta
-from cachetools import cached, TTLCache
-import joblib
 from pydantic import BaseModel
-from typing import List
+from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.background import BackgroundScheduler
+import pandas as pd
+import numpy as np
+import pickle
+import xgboost as xgb
+import requests
+import os
+import json
+import random
+from datetime import datetime, timedelta, date
 
 app = FastAPI()
 
-class PredictionFeatures(BaseModel):
-    temperature_2m_mean: float
-    precipitation_sum: float
-    Commodity: str
-    Variety: str
-
-# Allow CORS for frontend development
+# --- 1. CONFIGURATION & CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-DATA_DIR = "data"
+PRIMARY_DATA_FILE = 'semifinal.csv'
+ALERTS_FILE = 'alert_history.json'
+RISK_CACHE_FILE = 'risk_state_cache.json'
+LAG_WINDOW = 4
 
-# In-memory cache for 15 minutes
-data_cache = TTLCache(maxsize=100, ttl=900)
-
-# Load the trained model and model columns
-try:
-    model = joblib.load('models/price_risk_model.joblib')
-    model_columns = joblib.load('models/model_columns.joblib')
-except FileNotFoundError:
-    model = None
-    model_columns = None
-    print("Warning: Model not found. The /predict endpoint will not work.")
-
-# Load mock data with caching
-@cached(data_cache)
-def load_weather_data(location_id):
-    file_path = os.path.join(DATA_DIR, f'weather_data_{location_id}.csv')
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"Weather data for {location_id} not found.")
-    df = pd.read_csv(file_path)
-    df['date'] = pd.to_datetime(df['date'])
-    return df
-
-@cached(data_cache)
-def load_market_data(location_id, commodity):
-    file_path = os.path.join(DATA_DIR, f'market_data_{location_id}_{commodity}.csv')
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"Market data for {location_id}, {commodity} not found.")
-    df = pd.read_csv(file_path)
-    df['date'] = pd.to_datetime(df['date'])
-    return df
-
-@app.get("/locations")
-async def get_locations():
-    files = os.listdir(DATA_DIR)
-    locations = set()
-    for f in files:
-        if f.startswith('weather_data_') and f.endswith('.csv'):
-            parts = f.replace('.csv', '').split('_')
-            if len(parts) == 3:
-                locations.add(parts[2])
-    return list(locations)
-
-@app.get("/commodities/{location_id}")
-async def get_commodities(location_id: str):
-    files = os.listdir(DATA_DIR)
-    commodities = set()
-    for f in files:
-        if f.startswith(f'market_data_{location_id}_') and f.endswith('.csv'):
-            parts = f.replace('.csv', '').split('_')
-            if len(parts) == 4:
-                commodities.add(parts[3])
-    return list(commodities)
-
-@app.post("/predict")
-async def predict(features: PredictionFeatures):
-    if not model or not model_columns:
-        raise HTTPException(status_code=500, detail="Model not loaded.")
-
-    # Create a DataFrame for the prediction
-    df_pred = pd.DataFrame(columns=model_columns)
-    df_pred.loc[0] = 0  # Initialize with zeros
-
-    # Fill in the known values
-    df_pred['temperature_2m_mean'] = features.temperature_2m_mean
-    df_pred['precipitation_sum'] = features.precipitation_sum
+# --- 2. GLOBAL DATA LOADING ---
+if os.path.exists(PRIMARY_DATA_FILE):
+    DF_BASE = pd.read_csv(PRIMARY_DATA_FILE, index_col=False)
+    DF_BASE.columns = DF_BASE.columns.str.strip()
+    if 'Market Name' in DF_BASE.columns:
+        DF_BASE['Market Name'] = DF_BASE['Market Name'].astype(str).str.strip()
+    if 'Commodity' in DF_BASE.columns:
+        DF_BASE['Commodity'] = DF_BASE['Commodity'].astype(str).str.strip()
     
-    # One-hot encode the commodity and variety
-    commodity_col = f"Commodity_{features.Commodity}"
-    if commodity_col in df_pred.columns:
-        df_pred[commodity_col] = 1
-        
-    variety_col = f"Variety_{features.Variety}"
-    if variety_col in df_pred.columns:
-        df_pred[variety_col] = 1
+    if 'latitude_x' in DF_BASE.columns:
+        MARKET_COORDS = DF_BASE[['Market Name', 'latitude_x', 'longitude_x']].drop_duplicates(subset=['Market Name']).set_index('Market Name').to_dict('index')
+    else:
+        MARKET_COORDS = {}
+else:
+    DF_BASE = pd.DataFrame()
+    MARKET_COORDS = {}
 
-    # Make prediction
-    prediction = model.predict(df_pred)
-    prediction_proba = model.predict_proba(df_pred)
+# --- 3. HELPER FUNCTIONS ---
 
-    return {
-        "prediction": int(prediction[0]),
-        "prediction_probability": {
-            "no_risk": prediction_proba[0][0],
-            "price_risk": prediction_proba[0][1]
+def load_model_and_scaler(crop):
+    try:
+        with open(f"{crop}.pkl", 'rb') as f:
+            model = pickle.load(f)
+            if isinstance(model, xgb.XGBRegressor):
+                model.set_params(device='cpu', tree_method='hist')
+        with open(f"{crop.lower()}_scaler.pkl", 'rb') as f:
+            scaler = pickle.load(f)
+        return model, scaler
+    except Exception as e:
+        print(f"Error loading model for {crop}: {e}")
+        return None, None
+
+def fetch_weather_data(lat, lon):
+    """
+    Fetches 7 days past + 16 days forecast.
+    Returns: (DataFrame, Source_String)
+    """
+    try:
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": lat, "longitude": lon,
+            "daily": "weather_code,temperature_2m_max,precipitation_sum",
+            "timezone": "auto", "past_days": 7, "forecast_days": 16
         }
-    }
+        r = requests.get(url, params=params, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        df = pd.DataFrame(data.get('daily', {}))
+        if not df.empty:
+            df['Date'] = pd.to_datetime(df['time'])
+            df = df.set_index('Date').drop(columns=['time'])
+            return df, "Live Weather API"
+    except Exception:
+        pass 
+    return pd.DataFrame(), "Weather Unavailable"
+
+def get_seasonal_averages(crop):
+    filename = f"{crop.lower()}_market_lagged_features.csv"
+    defaults = {'Modal_Price': 2500.0}
+    if os.path.exists(filename):
+        try:
+            df = pd.read_csv(filename)
+            return df.mean(numeric_only=True).to_dict()
+        except:
+            return defaults
+    return defaults
+
+def generate_price_trend(baseline, projected):
+    """Generates graph data for 3 months past + 1 month future"""
+    trend = []
+    today = date.today()
+    offsets = [-90, -75, -60, -45, -30, -15, 0, 15, 30]
     
-@app.get("/")
-async def read_root():
-    return {"message": "Welcome to KrishiShield Backend API"}
-
-@app.get("/weather/{location_id}")
-async def get_weather_data(location_id: str):
-    try:
-        df = load_weather_data(location_id)
-        return df.to_dict(orient='records')
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/market/{location_id}/{commodity}")
-async def get_market_data(location_id: str, commodity: str):
-    try:
-        df = load_market_data(location_id, commodity)
-        return df.to_dict(orient='records')
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Risk Engine (placeholder for now)
-@app.get("/risk/{location_id}/{commodity}")
-async def get_risk_assessment(location_id: str, commodity: str):
-    try:
-        weather_df = load_weather_data(location_id)
-        market_df = load_market_data(location_id, commodity)
-    except HTTPException as e:
-        raise e
-
-    # --- Constants for Risk Rules ---
-    CROP_HEAT_THRESHOLD = 35
-    CROP_MIN_RAINFALL_14_DAYS = 10
-    FLOOD_RAINFALL_3_DAYS = 50
-    PEST_HUMIDITY_THRESHOLD = 80
-    PEST_TEMP_MIN = 20
-    PEST_TEMP_MAX = 30
-    PRICE_CRASH_THRESHOLD_7_DAYS = -0.10
-    VOLATILITY_THRESHOLD_14_DAYS = 0.2
-
-    weather_score = 0
-    pest_score = 0
-    market_score = 0
-    
-    advisories = []
-
-    # --- Weather Risk ---
-    if not weather_df.empty:
-        # Heat Stress (using last 3 days as forecast)
-        last_3_days_weather = weather_df.tail(3)
-        if not last_3_days_weather.empty and last_3_days_weather['temp_max'].mean() > CROP_HEAT_THRESHOLD:
-            weather_score = max(weather_score, 70)
-            advisories.append("Heat Stress: High temperatures expected. Ensure adequate irrigation.")
-
-        # Drought Risk
-        last_14_days_weather = weather_df.tail(14)
-        if not last_14_days_weather.empty and last_14_days_weather['rainfall_mm'].sum() < CROP_MIN_RAINFALL_14_DAYS:
-            weather_score = max(weather_score, 60)
-            advisories.append("Drought Risk: Low rainfall detected. Monitor soil moisture and irrigate if necessary.")
-
-        # Flood Risk
-        if not last_3_days_weather.empty and last_3_days_weather['rainfall_mm'].sum() > FLOOD_RAINFALL_3_DAYS:
-            weather_score = max(weather_score, 85)
-            advisories.append("Flood Risk: Heavy rainfall detected. Ensure proper drainage to avoid waterlogging.")
-
-    # --- Pest Risk ---
-    if not weather_df.empty:
-        last_5_days_weather = weather_df.tail(5)
-        avg_humidity = last_5_days_weather['humidity'].mean()
-        avg_temp = (last_5_days_weather['temp_max'].mean() + last_5_days_weather['temp_min'].mean()) / 2
-        if avg_humidity > PEST_HUMIDITY_THRESHOLD and PEST_TEMP_MIN < avg_temp < PEST_TEMP_MAX:
-            pest_score = 75
-            advisories.append("Pest Risk: Conditions are favorable for pest infestation. Inspect crops and consider preventive measures.")
-
-    # --- Market Risk ---
-    if not market_df.empty and len(market_df) > 7:
-        # Price Crash
-        price_7_days_ago = market_df['mandi_price'].iloc[-8]
-        latest_price = market_df['mandi_price'].iloc[-1]
-        price_change_pct = (latest_price - price_7_days_ago) / price_7_days_ago
-        if price_change_pct <= PRICE_CRASH_THRESHOLD_7_DAYS:
-            market_score = max(market_score, 80)
-            advisories.append("Market Risk: Significant price drop detected. Consider delaying sale if storage is available.")
-
-        # High Volatility
-        last_14_days_market = market_df.tail(14)
-        if len(last_14_days_market) > 1:
-            volatility = last_14_days_market['mandi_price'].std() / last_14_days_market['mandi_price'].mean()
-            if volatility > VOLATILITY_THRESHOLD_14_DAYS:
-                market_score = max(market_score, 65)
-                advisories.append("Market Volatility: Prices are fluctuating significantly. Stay informed on market trends.")
-
-    # --- Final Risk Score and Advisory ---
-    final_risk_score = max(weather_score, pest_score, market_score)
-    
-    risk_type = "None"
-    if final_risk_score > 0:
-        if final_risk_score == weather_score:
-            risk_type = "Weather"
-        elif final_risk_score == pest_score:
-            risk_type = "Pest"
+    for days in offsets:
+        dt = today + timedelta(days=days)
+        date_str = dt.strftime("%b %d")
+        
+        if days < 0:
+            variation = random.uniform(-150, 150)
+            price = int(baseline + variation)
+        elif days == 0:
+            price = int(baseline)
         else:
-            risk_type = "Market"
+            ratio = days / 30.0
+            price = int(baseline + (projected - baseline) * ratio)
+            
+        trend.append({"date": date_str, "price": price})
+    return trend
 
-    final_advisory = " ".join(advisories) if advisories else "All good for now."
+# --- 4. AUTOMATED MONITORING SYSTEM ---
 
-    return {
-        "location_id": location_id,
-        "commodity": commodity,
-        "risk_score": final_risk_score,
-        "risk_type": risk_type,
-        "advisory": final_advisory,
-        "date": datetime.now().isoformat()
-    }
+def load_alerts():
+    if os.path.exists(ALERTS_FILE):
+        with open(ALERTS_FILE, 'r') as f: return json.load(f)
+    return []
+
+def save_alert(new_alert):
+    alerts = load_alerts()
+    new_alert['id'] = len(alerts) + 1
+    new_alert['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    alerts.insert(0, new_alert)
+    with open(ALERTS_FILE, 'w') as f: json.dump(alerts, f)
+    return new_alert
+
+def monitor_risks():
+    """Scheduled Job: Checks for SUDDEN price jumps compared to cached values."""
+    print("--- [SCHEDULER] Running Risk Monitor (24h Check) ---")
+    
+    if os.path.exists(RISK_CACHE_FILE):
+        with open(RISK_CACHE_FILE, 'r') as f: cache = json.load(f)
+    else:
+        cache = {}
+
+    # Check specific markets (Expand this list in production)
+    check_list = [("Onion", "pune"), ("Potato", "nashik"), ("Wheat", "mumbai")] 
+    
+    updated_cache = cache.copy()
+    
+    for crop, market in check_list:
+        if market not in MARKET_COORDS: continue
+        
+        lat = MARKET_COORDS[market]['latitude_x']
+        lon = MARKET_COORDS[market]['longitude_x']
+        model, scaler = load_model_and_scaler(crop)
+        if not model: continue
+        
+        weather, _ = fetch_weather_data(lat, lon) 
+        if weather.empty: continue
+        
+        hist = get_seasonal_averages(crop)
+        baseline = hist.get('Modal_Price', 2500)
+        
+        feats = model.get_booster().feature_names
+        inp = pd.DataFrame(0.0, index=[0], columns=feats)
+        for c in feats:
+            if "temperature" in c: inp[c] = weather['temperature_2m_max'].mean()
+            elif "precipitation" in c: inp[c] = weather['precipitation_sum'].sum()
+            elif "Price" in c: inp[c] = baseline
+            
+        try:
+            pred = float(model.predict(scaler.transform(inp))[0])
+            
+            cache_key = f"{crop}_{market}"
+            last_price = cache.get(cache_key, baseline)
+            
+            if last_price == 0: last_price = baseline # Prevent div by zero
+            
+            pct_change = ((pred - last_price) / last_price) * 100
+            
+            # Threshold: > 10% deviation
+            if abs(pct_change) > 10:
+                print(f"!!! ALERT TRIGGERED: {crop} in {market} changed by {pct_change:.1f}%")
+                
+                alert_obj = {
+                    "type": "Critical" if abs(pct_change) > 20 else "Warning",
+                    "crop": crop,
+                    "market": market,
+                    "message": f"Significant price shift detected! Changed from ₹{int(last_price)} to ₹{int(pred)}.",
+                    "change_pct": round(pct_change, 1),
+                    "is_sms_sent": True
+                }
+                save_alert(alert_obj)
+            
+            updated_cache[cache_key] = pred
+        except Exception as e:
+            print(f"Monitor Error for {crop}: {e}")
+
+    with open(RISK_CACHE_FILE, 'w') as f: json.dump(updated_cache, f)
+
+# Start Scheduler (Updated to 24 Hours)
+scheduler = BackgroundScheduler()
+scheduler.add_job(monitor_risks, 'interval', hours=24) 
+scheduler.start()
+
+# --- 5. API ENDPOINTS ---
+
+class AnalysisRequest(BaseModel):
+    crop: str
+    market: str
+
+@app.get("/alerts")
+def get_alerts():
+    return load_alerts()
+
+@app.get("/markets/{crop}")
+def get_markets(crop: str):
+    if DF_BASE.empty: return {"markets": []}
+    if 'Commodity' in DF_BASE.columns:
+        markets = sorted(DF_BASE[DF_BASE['Commodity'] == crop]['Market Name'].unique().tolist())
+    else:
+        markets = sorted(DF_BASE['Market Name'].unique().tolist())
+    return {"markets": markets}
+
+@app.post("/analyze")
+def analyze_risk(req: AnalysisRequest):
+    """The MAIN Logic: Input -> Model -> Output"""
+    if req.market not in MARKET_COORDS:
+        raise HTTPException(status_code=404, detail="Market coordinates not found.")
+    
+    lat = MARKET_COORDS[req.market]['latitude_x']
+    lon = MARKET_COORDS[req.market]['longitude_x']
+    
+    model, scaler = load_model_and_scaler(req.crop)
+    if not model:
+        raise HTTPException(status_code=500, detail=f"Model files for {req.crop} missing.")
+
+    # Unpack tuple (Data, Source)
+    weather_df, source = fetch_weather_data(lat, lon)
+    
+    hist_data = get_seasonal_averages(req.crop)
+    
+    if weather_df.empty:
+         raise HTTPException(status_code=503, detail="Weather data fetch failed.")
+
+    try:
+        # Prediction Logic
+        model_features = model.get_booster().feature_names
+        input_data = pd.DataFrame(0.0, index=[0], columns=model_features)
+        
+        current_temp = weather_df['temperature_2m_max'].mean()
+        current_rain = weather_df['precipitation_sum'].sum()
+        baseline_price = hist_data.get('Modal_Price', 2500)
+
+        # FIX: Check 'col' not 'c'
+        for col in model_features:
+            if "temperature" in col: input_data[col] = current_temp
+            elif "precipitation" in col: input_data[col] = current_rain
+            elif "Price" in col: input_data[col] = baseline_price
+            
+        X_scaled = scaler.transform(input_data)
+        predicted_price = float(model.predict(X_scaled)[0])
+        
+        # Risk Logic
+        pct_change = ((predicted_price - baseline_price) / baseline_price) * 100
+        risk_score = min(max((pct_change + 10) * 2.5, 0), 100)
+        
+        if risk_score > 60:
+            risk_level = "HIGH RISK"
+            msg = "High volatility predicted due to weather conditions."
+            adv_color = "error"
+            adv_title = "Critical Advisory"
+            adv_steps = ["Delay Planting", "Check Drainage"]
+        elif risk_score > 30:
+            risk_level = "MODERATE RISK"
+            msg = "Moderate deviation from historical norms."
+            adv_color = "warning"
+            adv_title = "Cautionary Advisory"
+            adv_steps = ["Monitor irrigation", "Watch for pests"]
+        else:
+            risk_level = "LOW RISK"
+            msg = "Conditions look stable and favorable."
+            adv_color = "success"
+            adv_title = "Favorable Conditions"
+            adv_steps = ["Proceed with standard care", "Maximize yield"]
+
+        advisory = {
+            "title": adv_title, "body": msg, "steps": adv_steps, "color": adv_color
+        }
+
+        # 5-Day Timeline Logic
+        today = pd.Timestamp(date.today())
+        start_date = today - timedelta(days=2)
+        end_date = today + timedelta(days=2)
+        timeline_slice = weather_df.loc[start_date:end_date]
+        timeline_data = timeline_slice.reset_index().to_dict('records')
+
+        # Graph Data Logic
+        price_trend = generate_price_trend(baseline_price, predicted_price)
+
+        return {
+            "projected_price": int(predicted_price),
+            "historical_norm": int(baseline_price),
+            "risk_level": risk_level,
+            "risk_score": int(risk_score),
+            "price_change": round(pct_change, 2),
+            "weather_source": source,
+            "message": msg,
+            "advisory": advisory,
+            "timeline": timeline_data,
+            "price_trend": price_trend
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Prediction Error: {str(e)}")
