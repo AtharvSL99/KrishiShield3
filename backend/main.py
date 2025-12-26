@@ -280,6 +280,9 @@ def analyze_risk(req: AnalysisRequest):
     if req.market not in MARKET_COORDS:
         raise HTTPException(status_code=404, detail="Market coordinates not found.")
     
+    # Initialize variables to prevent UnboundLocalError
+    predicted_price = 0 
+    
     lat = MARKET_COORDS[req.market]['latitude_x']
     lon = MARKET_COORDS[req.market]['longitude_x']
     
@@ -287,83 +290,74 @@ def analyze_risk(req: AnalysisRequest):
     if not model:
         raise HTTPException(status_code=500, detail=f"Model files for {req.crop} missing.")
 
-    # Unpack tuple (Data, Source)
     weather_df, source = fetch_weather_data(lat, lon)
-    
-    hist_data = get_seasonal_averages(req.crop)
-    
     if weather_df.empty:
          raise HTTPException(status_code=503, detail="Weather data fetch failed.")
 
+    # --- UPDATED: Mandi-Specific Baseline Calculation ---
+    market_data = DF_BASE[
+        (DF_BASE['Commodity'] == req.crop) & 
+        (DF_BASE['Market Name'] == req.market)
+    ]
+    
+    if not market_data.empty:
+        # Calculate the actual average for this specific Mandi
+        baseline_price = float(market_data['Modal_Price'].mean())
+    else:
+        # Fallback to seasonal average if specific market data is missing
+        hist_data = get_seasonal_averages(req.crop)
+        baseline_price = hist_data.get('Modal_Price', 2500)
+
     try:
-        # Prediction Logic
         model_features = model.get_booster().feature_names
         input_data = pd.DataFrame(0.0, index=[0], columns=model_features)
         
         current_temp = weather_df['temperature_2m_max'].mean()
         current_rain = weather_df['precipitation_sum'].sum()
-        baseline_price = hist_data.get('Modal_Price', 2500)
 
-        # FIX: Check 'col' not 'c'
         for col in model_features:
             if "temperature" in col: input_data[col] = current_temp
             elif "precipitation" in col: input_data[col] = current_rain
             elif "Price" in col: input_data[col] = baseline_price
             
         X_scaled = scaler.transform(input_data)
+        # Assign to predicted_price defined earlier
         predicted_price = float(model.predict(X_scaled)[0])
         
         # Risk Logic
         pct_change = ((predicted_price - baseline_price) / baseline_price) * 100
         risk_score = min(max((pct_change + 10) * 2.5, 0), 100)
         
+        # Determine risk level and advisory
         if risk_score > 60:
-            risk_level = "HIGH RISK"
-            msg = "High volatility predicted due to weather conditions."
-            adv_color = "error"
-            adv_title = "Critical Advisory"
-            adv_steps = ["Delay Planting", "Check Drainage"]
+            risk_level, msg, adv_color = "HIGH RISK", "High volatility predicted.", "error"
+            adv_title, adv_steps = "Critical Advisory", ["Delay Planting", "Check Drainage"]
         elif risk_score > 30:
-            risk_level = "MODERATE RISK"
-            msg = "Moderate deviation from historical norms."
-            adv_color = "warning"
-            adv_title = "Cautionary Advisory"
-            adv_steps = ["Monitor irrigation", "Watch for pests"]
+            risk_level, msg, adv_color = "MODERATE RISK", "Moderate deviation from norms.", "warning"
+            adv_title, adv_steps = "Cautionary Advisory", ["Monitor irrigation", "Watch for pests"]
         else:
-            risk_level = "LOW RISK"
-            msg = "Conditions look stable and favorable."
-            adv_color = "success"
-            adv_title = "Favorable Conditions"
-            adv_steps = ["Proceed with standard care", "Maximize yield"]
+            risk_level, msg, adv_color = "LOW RISK", "Conditions look stable.", "success"
+            adv_title, adv_steps = "Favorable Conditions", ["Proceed with standard care", "Maximize yield"]
 
-        advisory = {
-            "title": adv_title, "body": msg, "steps": adv_steps, "color": adv_color
-        }
+        advisory = {"title": adv_title, "body": msg, "steps": adv_steps, "color": adv_color}
 
-        # 5-Day Timeline Logic
+        # Timeline and Trend Logic
         today = pd.Timestamp(date.today())
-        start_date = today - timedelta(days=2)
-        end_date = today + timedelta(days=2)
-        timeline_slice = weather_df.loc[start_date:end_date]
-        timeline_data = timeline_slice.reset_index().to_dict('records')
-
-        # Graph Data Logic
-        price_trend = generate_price_trend(baseline_price, predicted_price)
-
+        timeline_slice = weather_df.loc[today - timedelta(days=2):today + timedelta(days=2)]
+        
         return {
             "projected_price": int(predicted_price),
-            "historical_norm": int(baseline_price),
+            "historical_norm": int(baseline_price), # Returns Mandi average to frontend
             "risk_level": risk_level,
             "risk_score": int(risk_score),
             "price_change": round(pct_change, 2),
             "weather_source": source,
             "message": msg,
             "advisory": advisory,
-            "timeline": timeline_data,
-            "price_trend": price_trend
+            "timeline": timeline_slice.reset_index().to_dict('records'),
+            "price_trend": generate_price_trend(baseline_price, predicted_price)
         }
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Prediction Error: {str(e)}")
+        print(f"Prediction Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
