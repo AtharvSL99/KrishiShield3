@@ -1,0 +1,32 @@
+/* src/index.css - Global Reset */
+
+:root {
+  font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background-color: #f4fdf4; /* Match the main background */
+}
+
+/* Optional: Custom Scrollbar for Dark Theme */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #262730; 
+}
+
+::-webkit-scrollbar-thumb {
+  background: #555; 
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #777; 
+}
