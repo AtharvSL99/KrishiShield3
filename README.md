@@ -1,2 +1,0 @@
-# KrishiShield
-SciTech Hackathon
