@@ -63,13 +63,14 @@ def load_model_and_scaler(crop):
 def fetch_weather_data(lat, lon):
     """
     Fetches 7 days past + 16 days forecast.
-    Returns: (DataFrame, Source_String)
+    UPDATED: Now includes wind_speed_10m_max and temperature_2m_min
     """
     try:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
             "latitude": lat, "longitude": lon,
-            "daily": "weather_code,temperature_2m_max,precipitation_sum",
+            # CRITICAL FIX HERE: Added wind_speed_10m_max and temperature_2m_min
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max",
             "timezone": "auto", "past_days": 7, "forecast_days": 16
         }
         r = requests.get(url, params=params, timeout=5)

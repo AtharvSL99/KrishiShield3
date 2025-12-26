@@ -253,7 +253,9 @@ th { background-color: #f8fafc; color: #64748b; }
   }
 }
 
-/* --- Weather Card Specifics --- */
+/* Add to src/App.css */
+
+/* Weather Card Specifics */
 .weather-card-header {
   display: flex;
   justify-content: space-between;
@@ -261,31 +263,36 @@ th { background-color: #f8fafc; color: #64748b; }
   margin-bottom: 1.5rem;
 }
 
-.weather-main {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  margin-bottom: 2rem;
-}
-
-.weather-temp-big {
-  font-size: 3rem;
+.weather-location h2 {
+  margin: 0;
+  font-size: 1.4rem;
+  color: #0f172a;
   font-weight: 700;
-  color: #1e293b;
-  line-height: 1;
 }
 
+.weather-location p {
+  margin: 4px 0 0 0;
+  color: #64748b;
+  font-size: 0.9rem;
+}
+
+/* 2x2 Grid for Weather Stats */
 .weather-stats-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1.5rem;
+  grid-template-columns: 1fr 1fr; /* Two columns */
+  row-gap: 1.5rem; /* Space between rows */
+  column-gap: 1rem; /* Space between columns */
 }
 
 .weather-stat-item {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   font-size: 1.1rem;
   color: #334155;
   font-weight: 500;
+}
+
+.weather-stat-item svg {
+  min-width: 24px; /* Ensure icons align perfectly */
 }

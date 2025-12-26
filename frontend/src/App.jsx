@@ -1,6 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
-import { Sprout, TrendingUp, AlertTriangle, MapPin, Menu, X, Bell, Wifi, WifiOff, MessageSquare, Database } from 'lucide-react';
+import { 
+  Sprout, TrendingUp, AlertTriangle, MapPin, Menu, X, Bell, Wifi, WifiOff, MessageSquare, Database,
+  Sun, Cloud, CloudRain, CloudLightning, Snowflake, Droplets, Wind, ArrowDown
+} from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { getStoredAlerts, saveAlertToDB, saveAppState, getAppState, saveMarketList, getMarketList, saveAnalysisResult, getAnalysisResult } from './db'; 
 import './App.css'; 
@@ -114,7 +117,7 @@ function App() {
       } catch (err) { setError("Could not load markets."); }
     };
     fetchMarkets();
-  }, [crop, isOnline]); // Re-run when crop changes OR we come back online
+  }, [crop, isOnline]);
 
   // --- ANALYZE ACTION (Online + Offline Fallback) ---
   const handleAnalyze = async () => {
@@ -165,6 +168,23 @@ function App() {
     const diffDays = Math.ceil((d - today) / (86400000));
     if (diffDays === -1) return "Yesterday"; if (diffDays === 0) return "Today"; if (diffDays === 1) return "Tomorrow";
     return d.toLocaleDateString(undefined, {weekday: 'short'});
+  };
+
+  // --- Weather Helpers ---
+  const getWeatherIcon = (code) => {
+    if (code >= 95) return <CloudLightning size={36} color="#6366f1" />;
+    if (code >= 71) return <Snowflake size={36} color="#3b82f6" />;
+    if (code >= 51) return <CloudRain size={36} color="#0ea5e9" />;
+    if (code >= 1) return <Cloud size={36} color="#94a3b8" />;
+    return <Sun size={36} color="#f59e0b" />;
+  };
+
+  const getWeatherLabel = (code) => {
+    if (code >= 95) return "Stormy";
+    if (code >= 71) return "Snow";
+    if (code >= 51) return "Rainy";
+    if (code >= 1) return "Cloudy";
+    return "Sunny";
   };
 
   return (
@@ -251,6 +271,8 @@ function App() {
         {data ? (
           <div className="fade-in"> 
             <div className="metrics-grid">
+              
+              {/* Card 1: Projected Price */}
               <div className="metric-card">
                 <p style={{ color: '#64748b' }}>Projected Price</p>
                 <div className="price-value">₹ {data.projected_price.toLocaleString()}</div>
@@ -258,6 +280,8 @@ function App() {
                   <TrendingUp size={18} /> {data.price_change}% vs Norm
                 </div>
               </div>
+
+              {/* Card 2: Risk Level */}
               <div className="metric-card" style={{ textAlign: 'center' }}>
                 <p style={{ color: '#64748b' }}>Risk Level</p>
                 <div className="risk-value" style={{ color: getRiskColor(data.risk_level) }}>
@@ -267,11 +291,48 @@ function App() {
                   <div className="risk-fill" style={{ width: `${data.risk_score}%`, backgroundColor: getRiskColor(data.risk_level), height: '100%', borderRadius: '6px', transition: 'width 1s ease'}}></div>
                 </div>
               </div>
-              <div className="metric-card source-box">
-                <p style={{ color: '#0369a1' }}>Data Source</p>
-                <p style={{fontSize: '1.1rem', margin: '10px 0', fontWeight:'700', color: '#0284c7'}}>{data.weather_source}</p>
-                <p style={{ color: '#0c4a6e', fontSize: '0.95rem' }}>{data.message}</p>
+
+              {/* Card 3: EXPANDED Weather Card */}
+              <div className="metric-card weather-card">
+                 <div style={{display:'flex', justifyContent:'space-between', alignItems:'flex-start'}}>
+                    <div>
+                      <p style={{ color: '#64748b', marginBottom:'5px' }}>Current Weather</p>
+                      <div style={{ fontSize: '2.5rem', fontWeight: '800', color: '#1e293b' }}>
+                        {data.timeline[0]?.temperature_2m_max}°C
+                      </div>
+                      <p style={{ color: '#334155', fontWeight:'600', display:'flex', alignItems:'center', gap:'5px', marginTop:'5px' }}>
+                         {getWeatherLabel(data.timeline[0]?.weather_code || 0)}
+                      </p>
+                    </div>
+                    <div style={{background:'#f0f9ff', padding:'10px', borderRadius:'12px'}}>
+                      {getWeatherIcon(data.timeline[0]?.weather_code || 0)}
+                    </div>
+                 </div>
+                 
+                 {/* New: Weather Grid for Params */}
+                 <div style={{marginTop:'15px', paddingTop:'15px', borderTop:'1px solid #f1f5f9', display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:'5px'}}>
+                    
+                    <div style={{textAlign:'center'}}>
+                       <Droplets size={16} color="#0ea5e9" style={{marginBottom:'4px'}}/> 
+                       <div style={{fontSize:'0.85rem', fontWeight:'bold', color:'#334155'}}>{data.timeline[0]?.precipitation_sum || 0}mm</div>
+                       <div style={{fontSize:'0.7rem', color:'#64748b'}}>Rain</div>
+                    </div>
+
+                    <div style={{textAlign:'center', borderLeft:'1px solid #f1f5f9', borderRight:'1px solid #f1f5f9'}}>
+                       <Wind size={16} color="#64748b" style={{marginBottom:'4px'}}/> 
+                       <div style={{fontSize:'0.85rem', fontWeight:'bold', color:'#334155'}}>{data.timeline[0]?.wind_speed_10m_max || 0}</div>
+                       <div style={{fontSize:'0.7rem', color:'#64748b'}}>km/h</div>
+                    </div>
+
+                    <div style={{textAlign:'center'}}>
+                       <ArrowDown size={16} color="#0ea5e9" style={{marginBottom:'4px'}}/> 
+                       <div style={{fontSize:'0.85rem', fontWeight:'bold', color:'#334155'}}>{data.timeline[0]?.temperature_2m_min || 0}°C</div>
+                       <div style={{fontSize:'0.7rem', color:'#64748b'}}>Min</div>
+                    </div>
+
+                 </div>
               </div>
+
             </div>
 
             <div style={{ background: 'white', padding: '1.5rem', borderRadius: '16px', border: '1px solid #e2e8f0', marginBottom: '2rem', boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
