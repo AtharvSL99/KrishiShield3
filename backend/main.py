@@ -12,6 +12,7 @@ import json
 import random
 from datetime import datetime, timedelta, date
 
+
 app = FastAPI()
 
 # --- 1. CONFIGURATION & CORS ---

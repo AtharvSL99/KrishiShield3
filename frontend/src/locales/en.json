@@ -1,0 +1,41 @@
+{
+  "app_title": "Krishi Shield",
+  "risk_calculator": "{{crop}} Future Risk Calculator",
+  "subtitle": "AI-Driven Market Analysis • {{market}}",
+  "select_crop": "Select Crop",
+  "select_market": "Select Market",
+  "analyze_btn": "Analyze Future Risk",
+  "analyzing": "Analyzing...",
+  "load_offline": "Load Offline Data",
+  "offline_mode": "Offline Mode",
+  "offline_desc": "You can only view markets you have previously analyzed.",
+  "online": "Online",
+  "offline": "Offline",
+  "projected_price": "Projected Price",
+  "vs_norm": "vs Norm",
+  "risk_level": "Risk Level",
+  "current_weather": "Current Weather",
+  "rain": "Rain",
+  "min": "Min",
+  "market_trend": "Market Price Trend (3 Months)",
+  "forecast_impact": "5-Day Weather Forecast & Impact",
+  "day": "Day",
+  "date": "Date",
+  "max_temp": "Max Temp",
+  "precip": "Precipitation",
+  "alert_history": "Alert History",
+  "no_alerts": "No recent alerts.",
+  "select_prompt": "Select a crop and market to begin analysis.",
+  "offline_prompt": "You are offline. Showing last cached data if available.",
+  "advisory": "Advisory",
+  "crops": {
+    "Onion": "Onion",
+    "Wheat": "Wheat",
+    "Potato": "Potato"
+  },
+  "markets": {
+  "Pune": "Pune",
+  "Mumbai": "Mumbai",
+  "Nashik": "Nashik"
+  }
+}
