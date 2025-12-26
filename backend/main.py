@@ -252,7 +252,7 @@ def monitor_risks():
 
 # Start Scheduler (Updated to 24 Hours)
 scheduler = BackgroundScheduler()
-scheduler.add_job(monitor_risks, 'interval', hours=24) 
+scheduler.add_job(monitor_risks, 'interval', seconds=30) 
 scheduler.start()
 
 # --- 5. API ENDPOINTS ---
