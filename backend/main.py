@@ -1,4 +1,9 @@
+import os
+from dotenv import load_dotenv
+from twilio.rest import Client # NEW: Missing Import
 from fastapi import FastAPI, HTTPException
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -7,11 +12,19 @@ import numpy as np
 import pickle
 import xgboost as xgb
 import requests
-import os
 import json
 import random
 from datetime import datetime, timedelta, date
 
+# Load variables from .env file
+load_dotenv()
+
+# --- TWILIO CREDENTIALS ---
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+TWILIO_SMS_NUMBER = os.getenv('TWILIO_SMS_NUMBER')
+TWILIO_WA_NUMBER = os.getenv('TWILIO_WA_NUMBER')
+FARMER_PHONE_NUMBER = os.getenv('FARMER_PHONE_NUMBER')
 
 app = FastAPI()
 
@@ -48,14 +61,23 @@ else:
 
 # --- 3. HELPER FUNCTIONS ---
 
+# --- 3. HELPER FUNCTIONS ---
+
 def load_model_and_scaler(crop):
     try:
         with open(f"{crop}.pkl", 'rb') as f:
             model = pickle.load(f)
             if isinstance(model, xgb.XGBRegressor):
                 model.set_params(device='cpu', tree_method='hist')
+        
         with open(f"{crop.lower()}_scaler.pkl", 'rb') as f:
             scaler = pickle.load(f)
+        
+        # FIX: This prevents the 'InconsistentVersionWarning' from crashing 
+        # the prediction when using different scikit-learn versions.
+        if hasattr(scaler, "clip_") and not hasattr(scaler, "feature_names_in_"):
+            scaler.clip_ = None
+            
         return model, scaler
     except Exception as e:
         print(f"Error loading model for {crop}: {e}")
@@ -85,6 +107,29 @@ def fetch_weather_data(lat, lon):
     except Exception:
         pass 
     return pd.DataFrame(), "Weather Unavailable"
+
+def send_notification(message_body):
+    """Sends both SMS and WhatsApp via Twilio."""
+    try:
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        
+        # Send SMS
+        client.messages.create(
+            body=message_body,
+            from_=TWILIO_SMS_NUMBER,
+            to=FARMER_PHONE_NUMBER
+        )
+        
+        # Send WhatsApp
+        client.messages.create(
+            body=message_body,
+            from_=f"whatsapp:{TWILIO_WA_NUMBER}",
+            to=f"whatsapp:{FARMER_PHONE_NUMBER}"
+        )
+        return True
+    except Exception as e:
+        print(f"Twilio Error: {e}")
+        return False
 
 def get_seasonal_averages(crop):
     filename = f"{crop.lower()}_market_lagged_features.csv"
@@ -180,16 +225,22 @@ def monitor_risks():
             pct_change = ((pred - last_price) / last_price) * 100
             
             # Threshold: > 10% deviation
+            # Threshold: > 10% deviation
             if abs(pct_change) > 10:
-                print(f"!!! ALERT TRIGGERED: {crop} in {market} changed by {pct_change:.1f}%")
+                print(f"!!! ALERT TRIGGERED: {crop} in {market}")
+                
+                msg_text = f"Price Alert: {crop} in {market} is projected to reach ₹{int(pred)} (Change: {pct_change:.1f}%)."
+                
+                # TRIGGER ACTUAL NOTIFICATION
+                sms_status = send_notification(msg_text)
                 
                 alert_obj = {
                     "type": "Critical" if abs(pct_change) > 20 else "Warning",
                     "crop": crop,
                     "market": market,
-                    "message": f"Significant price shift detected! Changed from ₹{int(last_price)} to ₹{int(pred)}.",
+                    "message": msg_text,
                     "change_pct": round(pct_change, 1),
-                    "is_sms_sent": True
+                    "is_sms_sent": sms_status # Now reflects actual success
                 }
                 save_alert(alert_obj)
             
@@ -201,7 +252,7 @@ def monitor_risks():
 
 # Start Scheduler (Updated to 24 Hours)
 scheduler = BackgroundScheduler()
-scheduler.add_job(monitor_risks, 'interval', hours=24) 
+scheduler.add_job(monitor_risks, 'interval', seconds=30) 
 scheduler.start()
 
 # --- 5. API ENDPOINTS ---
@@ -229,6 +280,9 @@ def analyze_risk(req: AnalysisRequest):
     if req.market not in MARKET_COORDS:
         raise HTTPException(status_code=404, detail="Market coordinates not found.")
     
+    # Initialize variables to prevent UnboundLocalError
+    predicted_price = 0 
+    
     lat = MARKET_COORDS[req.market]['latitude_x']
     lon = MARKET_COORDS[req.market]['longitude_x']
     
@@ -236,83 +290,74 @@ def analyze_risk(req: AnalysisRequest):
     if not model:
         raise HTTPException(status_code=500, detail=f"Model files for {req.crop} missing.")
 
-    # Unpack tuple (Data, Source)
     weather_df, source = fetch_weather_data(lat, lon)
-    
-    hist_data = get_seasonal_averages(req.crop)
-    
     if weather_df.empty:
          raise HTTPException(status_code=503, detail="Weather data fetch failed.")
 
+    # --- UPDATED: Mandi-Specific Baseline Calculation ---
+    market_data = DF_BASE[
+        (DF_BASE['Commodity'] == req.crop) & 
+        (DF_BASE['Market Name'] == req.market)
+    ]
+    
+    if not market_data.empty:
+        # Calculate the actual average for this specific Mandi
+        baseline_price = float(market_data['Modal_Price'].mean())
+    else:
+        # Fallback to seasonal average if specific market data is missing
+        hist_data = get_seasonal_averages(req.crop)
+        baseline_price = hist_data.get('Modal_Price', 2500)
+
     try:
-        # Prediction Logic
         model_features = model.get_booster().feature_names
         input_data = pd.DataFrame(0.0, index=[0], columns=model_features)
         
         current_temp = weather_df['temperature_2m_max'].mean()
         current_rain = weather_df['precipitation_sum'].sum()
-        baseline_price = hist_data.get('Modal_Price', 2500)
 
-        # FIX: Check 'col' not 'c'
         for col in model_features:
             if "temperature" in col: input_data[col] = current_temp
             elif "precipitation" in col: input_data[col] = current_rain
             elif "Price" in col: input_data[col] = baseline_price
             
         X_scaled = scaler.transform(input_data)
+        # Assign to predicted_price defined earlier
         predicted_price = float(model.predict(X_scaled)[0])
         
         # Risk Logic
         pct_change = ((predicted_price - baseline_price) / baseline_price) * 100
         risk_score = min(max((pct_change + 10) * 2.5, 0), 100)
         
+        # Determine risk level and advisory
         if risk_score > 60:
-            risk_level = "HIGH RISK"
-            msg = "High volatility predicted due to weather conditions."
-            adv_color = "error"
-            adv_title = "Critical Advisory"
-            adv_steps = ["Delay Planting", "Check Drainage"]
+            risk_level, msg, adv_color = "HIGH RISK", "High volatility predicted.", "error"
+            adv_title, adv_steps = "Critical Advisory", ["Delay Planting", "Check Drainage"]
         elif risk_score > 30:
-            risk_level = "MODERATE RISK"
-            msg = "Moderate deviation from historical norms."
-            adv_color = "warning"
-            adv_title = "Cautionary Advisory"
-            adv_steps = ["Monitor irrigation", "Watch for pests"]
+            risk_level, msg, adv_color = "MODERATE RISK", "Moderate deviation from norms.", "warning"
+            adv_title, adv_steps = "Cautionary Advisory", ["Monitor irrigation", "Watch for pests"]
         else:
-            risk_level = "LOW RISK"
-            msg = "Conditions look stable and favorable."
-            adv_color = "success"
-            adv_title = "Favorable Conditions"
-            adv_steps = ["Proceed with standard care", "Maximize yield"]
+            risk_level, msg, adv_color = "LOW RISK", "Conditions look stable.", "success"
+            adv_title, adv_steps = "Favorable Conditions", ["Proceed with standard care", "Maximize yield"]
 
-        advisory = {
-            "title": adv_title, "body": msg, "steps": adv_steps, "color": adv_color
-        }
+        advisory = {"title": adv_title, "body": msg, "steps": adv_steps, "color": adv_color}
 
-        # 5-Day Timeline Logic
+        # Timeline and Trend Logic
         today = pd.Timestamp(date.today())
-        start_date = today - timedelta(days=2)
-        end_date = today + timedelta(days=2)
-        timeline_slice = weather_df.loc[start_date:end_date]
-        timeline_data = timeline_slice.reset_index().to_dict('records')
-
-        # Graph Data Logic
-        price_trend = generate_price_trend(baseline_price, predicted_price)
-
+        timeline_slice = weather_df.loc[today - timedelta(days=2):today + timedelta(days=2)]
+        
         return {
             "projected_price": int(predicted_price),
-            "historical_norm": int(baseline_price),
+            "historical_norm": int(baseline_price), # Returns Mandi average to frontend
             "risk_level": risk_level,
             "risk_score": int(risk_score),
             "price_change": round(pct_change, 2),
             "weather_source": source,
             "message": msg,
             "advisory": advisory,
-            "timeline": timeline_data,
-            "price_trend": price_trend
+            "timeline": timeline_slice.reset_index().to_dict('records'),
+            "price_trend": generate_price_trend(baseline_price, predicted_price)
         }
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Prediction Error: {str(e)}")
+        print(f"Prediction Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
