@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+twilio
+APScheduler
+pandas
+numpy
+scikit-learn
+xgboost
+requests
