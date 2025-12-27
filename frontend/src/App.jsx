@@ -3,7 +3,7 @@ import axios from 'axios';
 import { useTranslation } from 'react-i18next'; 
 import { 
   Sprout, TrendingUp, AlertTriangle, MapPin, Menu, X, Bell, Wifi, WifiOff, MessageSquare, Database,
-  Sun, Cloud, CloudRain, CloudLightning, Snowflake, Droplets, Wind, ArrowDown, Globe
+  Sun, Cloud, CloudRain, CloudLightning, Snowflake, Droplets, Wind, ArrowDown, Globe, Waves
 } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { getStoredAlerts, saveAlertToDB, saveAppState, getAppState, saveMarketList, getMarketList, saveAnalysisResult, getAnalysisResult } from './db'; 
@@ -26,17 +26,15 @@ function App() {
   const [showNotifications, setShowNotifications] = useState(false);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
 
-  // Alert System State
   const [alerts, setAlerts] = useState([]);
   const [lastAlertId, setLastAlertId] = useState(0); 
 
-  // Toggle Language Function
   const toggleLanguage = () => {
     const newLang = i18n.language === 'en' ? 'mr' : 'en';
     i18n.changeLanguage(newLang);
   };
 
-  // --- LIFECYCLE: Online Status & Init ---
+  // --- LIFECYCLE ---
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
@@ -45,20 +43,16 @@ function App() {
 
     if ("Notification" in window) Notification.requestPermission();
     
-    // Initial Load
     const loadInitData = async () => {
-      // 1. Alerts
       const savedAlerts = await getStoredAlerts();
       setAlerts(savedAlerts);
       if(savedAlerts.length > 0) setLastAlertId(savedAlerts[0].id);
 
-      // 2. Restore last selection
       const savedCrop = await getAppState('lastCrop');
       const savedMarket = await getAppState('lastMarket');
       if(savedCrop) setCrop(savedCrop);
       if(savedMarket) setMarket(savedMarket);
 
-      // 3. If offline, immediately try to load market list for default crop
       if (!navigator.onLine) {
         const offlineMarkets = await getMarketList(savedCrop || 'Onion');
         setMarketList(offlineMarkets);
@@ -73,7 +67,7 @@ function App() {
     };
   }, []);
 
-  // --- SCHEDULER: Poll for Alerts ---
+  // --- ALERTS ---
   useEffect(() => {
     const pollAlerts = async () => {
       if (!isOnline) return;
@@ -98,12 +92,11 @@ function App() {
     return () => clearInterval(interval);
   }, [isOnline, lastAlertId]);
 
-  // --- MARKET FETCHING (Online + Offline Fallback) ---
+  // --- MARKETS ---
   useEffect(() => {
     const fetchMarkets = async () => {
       try {
         setMarketList([]); 
-        
         if (isOnline) {
           const response = await axios.get(`http://127.0.0.1:8000/markets/${crop}`);
           const markets = response.data.markets;
@@ -123,7 +116,7 @@ function App() {
     fetchMarkets();
   }, [crop, isOnline]);
 
-  // --- ANALYZE ACTION ---
+  // --- ANALYZE ---
   const handleAnalyze = async () => {
     if (!market) return alert("Select market");
     
@@ -162,17 +155,13 @@ function App() {
 
   const getRiskColor = (level) => level.includes("HIGH") ? '#dc2626' : level.includes("MODERATE") ? '#d97706' : '#16a34a';
 
-  // Translate Date Labels
   const getDateLabel = (dateString) => {
     const d = new Date(dateString); const today = new Date(); d.setHours(0,0,0,0); today.setHours(0,0,0,0);
     const diffDays = Math.ceil((d - today) / (86400000));
-    
-    // In Marathi/English based on Locale
     const lang = i18n.language;
     if (diffDays === -1) return lang === 'mr' ? "काल" : "Yesterday";
     if (diffDays === 0) return lang === 'mr' ? "आज" : "Today";
     if (diffDays === 1) return lang === 'mr' ? "उद्या" : "Tomorrow";
-    
     return d.toLocaleDateString(lang === 'mr' ? 'mr-IN' : 'en-US', {weekday: 'short'});
   };
 
@@ -236,7 +225,6 @@ function App() {
         </div>
         <div className="form-group">
           <label>{t('select_market')}</label>
-          {/* UPDATED: Market Options are translated here */}
           <select 
             value={market} 
             onChange={(e) => setMarket(e.target.value)} 
@@ -248,7 +236,6 @@ function App() {
             ) : (
               marketList.map((m) => (
                 <option key={m} value={m}>
-                   {/* Maps 'Pune' to 'पुणे' using json file */}
                    {t(`markets.${m}`, { defaultValue: m })}
                 </option>
               ))
@@ -274,8 +261,8 @@ function App() {
       <main className="main-content">
         <div className="header" style={{display:'flex', justifyContent:'space-between', alignItems:'flex-start'}}>
           <div>
-            <h1><Sprout color="#15803d" size={40} /> {t('risk_calculator', {crop: t(`crops.${crop}`) || crop})}</h1>
-            {/* UPDATED: Subtitle translates the selected market */}
+            {/* UPDATED HEADER: 7-Day Forecast */}
+            <h1><Sprout color="#15803d" size={40} /> {crop} 7-Day Risk Calculator</h1>
             <p className="subtitle">
               {t('subtitle', { 
                  market: market ? t(`markets.${market}`, { defaultValue: market }) : t('select_market') 
@@ -283,12 +270,9 @@ function App() {
             </p>
           </div>
           <div style={{display:'flex', gap:'15px', alignItems:'center'}}>
-            
-            {/* Language Switcher Button */}
             <button onClick={toggleLanguage} style={{display:'flex', alignItems:'center', gap:'5px', padding:'8px 12px', borderRadius:'20px', border:'1px solid #cbd5e1', background:'white', cursor:'pointer', fontWeight:'bold', color:'#0f172a'}}>
                <Globe size={18} /> {i18n.language === 'en' ? 'English' : 'मराठी'}
             </button>
-
             <div style={{display:'flex', alignItems:'center', gap:'5px', color: isOnline ? '#16a34a' : '#ef4444', fontWeight:'bold', fontSize:'0.9rem'}}>
                {isOnline ? <Wifi size={18} /> : <WifiOff size={18} />}
                {isOnline ? t('online') : t('offline')}
@@ -305,11 +289,17 @@ function App() {
           <div className="fade-in"> 
             <div className="metrics-grid">
               
-              {/* Card 1: Projected Price */}
+              {/* Card 1: Projected Price (Final) */}
               <div className="metric-card">
                 <p style={{ color: '#64748b' }}>{t('projected_price')}</p>
                 <div className="price-value">₹ {data.projected_price.toLocaleString()}</div>
-                <div style={{ marginTop: '10px', fontWeight: '600', color: data.price_change > 0 ? '#dc2626' : '#16a34a', display: 'flex', alignItems: 'center', gap: '5px'}}>
+                
+                {/* NEW: Show Prediction Target Date */}
+                <div style={{fontSize:'0.85rem', color:'#94a3b8', marginBottom:'5px'}}>
+                   Target: {data.target_date}
+                </div>
+
+                <div style={{ marginTop: '5px', fontWeight: '600', color: data.price_change > 0 ? '#dc2626' : '#16a34a', display: 'flex', alignItems: 'center', gap: '5px'}}>
                   <TrendingUp size={18} /> {data.price_change}% {t('vs_norm')}
                 </div>
               </div>
@@ -342,21 +332,23 @@ function App() {
                     </div>
                  </div>
                  
-                 <div style={{marginTop:'20px', paddingTop:'20px', borderTop:'1px solid #f1f5f9', display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:'10px'}}>
+                 <div style={{marginTop:'20px', paddingTop:'20px', borderTop:'1px solid #f1f5f9', display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:'5px'}}>
                     <div style={{textAlign:'center'}}>
-                       <Droplets size={24} color="#0ea5e9" style={{marginBottom:'6px'}}/> 
-                       <div style={{fontSize:'1.1rem', fontWeight:'bold', color:'#334155'}}>{data.timeline[0]?.precipitation_sum || 0}mm</div>
-                       <div style={{fontSize:'0.9rem', color:'#64748b'}}>{t('rain')}</div>
+                       <Droplets size={20} color="#0ea5e9" style={{marginBottom:'6px'}}/> 
+                       <div style={{fontSize:'0.9rem', fontWeight:'bold', color:'#334155'}}>{data.timeline[0]?.precipitation_sum || 0}mm</div>
+                       <div style={{fontSize:'0.75rem', color:'#64748b'}}>{t('rain')}</div>
                     </div>
-                    <div style={{textAlign:'center', borderLeft:'1px solid #f1f5f9', borderRight:'1px solid #f1f5f9'}}>
-                       <Wind size={24} color="#64748b" style={{marginBottom:'6px'}}/> 
-                       <div style={{fontSize:'1.1rem', fontWeight:'bold', color:'#334155'}}>{data.timeline[0]?.wind_speed_10m_max || 0}</div>
-                       <div style={{fontSize:'0.9rem', color:'#64748b'}}>km/h</div>
+                    <div style={{textAlign:'center', borderLeft:'1px solid #f1f5f9'}}>
+                       <Waves size={20} color="#8b5cf6" style={{marginBottom:'6px'}}/> 
+                       <div style={{fontSize:'0.9rem', fontWeight:'bold', color:'#334155'}}>
+                          {data.timeline[0]?.relative_humidity_2m_mean?.toFixed(2) || 0}%
+                       </div>
+                       <div style={{fontSize:'0.75rem', color:'#64748b'}}>Humid</div>
                     </div>
-                    <div style={{textAlign:'center'}}>
-                       <ArrowDown size={24} color="#0ea5e9" style={{marginBottom:'6px'}}/> 
-                       <div style={{fontSize:'1.1rem', fontWeight:'bold', color:'#334155'}}>{data.timeline[0]?.temperature_2m_min || 0}°C</div>
-                       <div style={{fontSize:'0.9rem', color:'#64748b'}}>{t('min')}</div>
+                    <div style={{textAlign:'center', borderLeft:'1px solid #f1f5f9'}}>
+                       <ArrowDown size={20} color="#64748b" style={{marginBottom:'6px'}}/> 
+                       <div style={{fontSize:'0.9rem', fontWeight:'bold', color:'#334155'}}>{data.timeline[0]?.temperature_2m_min || 0}°</div>
+                       <div style={{fontSize:'0.75rem', color:'#64748b'}}>{t('min')}</div>
                     </div>
                  </div>
               </div>
@@ -364,7 +356,8 @@ function App() {
 
             {/* Graph */}
             <div style={{ background: 'white', padding: '1.5rem', borderRadius: '16px', border: '1px solid #e2e8f0', marginBottom: '2rem', boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
-              <h3 style={{ color: '#334155', marginTop: 0, marginBottom: '1.5rem' }}>{t('market_trend')}</h3>
+              {/* UPDATED CHART TITLE */}
+              <h3 style={{ color: '#334155', marginTop: 0, marginBottom: '1.5rem' }}>Price Trend (History + 7-Day Forecast)</h3>
               <div style={{ width: '100%', height: 300 }}>
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={data.price_trend}>
@@ -378,7 +371,6 @@ function App() {
               </div>
             </div>
 
-            {/* Advisory */}
             {data.advisory && (
                 <div className={`advisory-box ${data.advisory.color}`} style={{ padding: '1.5rem', borderRadius: '12px', marginBottom: '2rem', borderLeft: '5px solid', background: 'white', boxShadow: '0 1px 3px rgba(0,0,0,0.1)', borderColor: data.advisory.color === 'success' ? '#22c55e' : data.advisory.color === 'warning' ? '#eab308' : '#ef4444' }}>
                     <h3 style={{ marginTop: 0, color: '#334155' }}>{data.advisory.title}</h3>
@@ -389,7 +381,6 @@ function App() {
                 </div>
             )}
 
-            {/* Weather Table */}
             <h3 style={{ color: '#334155', marginTop:'2rem' }}>{t('forecast_impact')}</h3>
             <div className="data-table-container">
               <table>
