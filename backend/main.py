@@ -1,4 +1,9 @@
+import os
+from dotenv import load_dotenv
+from twilio.rest import Client # NEW: Missing Import
 from fastapi import FastAPI, HTTPException
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -7,12 +12,11 @@ import numpy as np
 import pickle
 import xgboost as xgb
 import requests
-import os
 import json
 import random
 import math
 from datetime import datetime, timedelta, date
-from io import StringIO
+
 
 app = FastAPI()
 
@@ -54,27 +58,16 @@ else:
 
 # --- 3. HELPER FUNCTIONS ---
 
+# --- 3. HELPER FUNCTIONS ---
+
 def load_model_and_scaler(crop):
     try:
-        if 'onion' in crop.lower() and os.path.exists("onion_xgboost_model_diff.json"):
-            print(f"--- Loading NEW JSON Diff Model for {crop} ---")
-            model = xgb.XGBRegressor()
-            model.load_model("onion_xgboost_model_diff.json")
-            model.set_params(device='cpu', n_jobs=1)
-            return model, None 
-            
-        elif os.path.exists(f"{crop}.pkl"):
-            with open(f"{crop}.pkl", 'rb') as f:
-                model = pickle.load(f)
-                if isinstance(model, xgb.XGBRegressor):
-                    model.set_params(device='cpu', n_jobs=1)
-        
-        scaler_path = f"{crop.lower()}_scaler.pkl"
-        scaler = None
-        if os.path.exists(scaler_path):
-            with open(scaler_path, 'rb') as f:
-                scaler = pickle.load(f)
-                
+        with open(f"{crop}.pkl", 'rb') as f:
+            model = pickle.load(f)
+            if isinstance(model, xgb.XGBRegressor):
+                model.set_params(device='cpu', tree_method='hist')
+        with open(f"{crop.lower()}_scaler.pkl", 'rb') as f:
+            scaler = pickle.load(f)
         return model, scaler
     except Exception as e:
         print(f"Error loading model for {crop}: {e}")
@@ -201,72 +194,16 @@ def fetch_extended_weather(lat, lon):
         print(f"Weather Fetch Error: {e}")
         return pd.DataFrame(), "Weather Unavailable"
 
-def prepare_input_vector(model, weather_df, price_stats):
-    required_features = model.get_booster().feature_names
-    today = pd.Timestamp(date.today()).normalize()
-    if today not in weather_df.index:
-        if not weather_df.empty: current_idx = weather_df.index[-1]
-        else: return pd.DataFrame() 
-    else:
-        current_idx = today
-
-    input_dict = {}
-    
-    # 1. Base Prices
-    modal_price = price_stats.get('Modal_Price', 2500)
-    input_dict['Modal_Price'] = modal_price
-    input_dict['Min_Price'] = modal_price * 0.85
-    input_dict['Max_Price'] = modal_price * 1.15
-    input_dict['Petrol_Price'] = CURRENT_PETROL
-    input_dict['Diesel_Price'] = CURRENT_DIESEL
-
-    # 2. Weather
-    temp_max = weather_df.loc[current_idx, 'temperature_2m_max'] if 'temperature_2m_max' in weather_df.columns else 0
-    humid_max = weather_df.loc[current_idx, 'relative_humidity_2m_max'] if 'relative_humidity_2m_max' in weather_df.columns else 0
-    rain_sum = weather_df.loc[current_idx, 'precipitation_sum'] if 'precipitation_sum' in weather_df.columns else 0
-
-    for col in weather_df.columns:
-        if col in required_features:
-            input_dict[col] = weather_df.loc[current_idx, col]
-
-    # 3. Lags
-    for lag in range(1, 5):
-        suffix = f"_Lag_{lag}"
-        lag_val = price_stats.get(f'Lag_{lag}', modal_price)
-        
-        input_dict[f'Modal_Price{suffix}'] = lag_val
-        input_dict[f'Min_Price{suffix}'] = lag_val * 0.85
-        input_dict[f'Max_Price{suffix}'] = lag_val * 1.15
-        input_dict[f'Petrol_Price{suffix}'] = CURRENT_PETROL
-        input_dict[f'Diesel_Price{suffix}'] = CURRENT_DIESEL
-        input_dict[f'weather_code{suffix}'] = 0
-        
-        lag_weather_date = current_idx - timedelta(days=lag)
-        if lag_weather_date in weather_df.index:
-             for col in weather_df.columns:
-                feat_name = f"{col}{suffix}"
-                if feat_name in required_features:
-                    input_dict[feat_name] = weather_df.loc[lag_weather_date, col]
-
-    # 4. Engineered Features
-    month = today.month
-    input_dict['Month'] = month
-    input_dict['Rain_x_Month'] = rain_sum * month
-    input_dict['Humidity_x_Temp'] = humid_max * temp_max
-    input_dict['Petrol_x_Price'] = CURRENT_PETROL * modal_price
-    input_dict['Diesel_x_Price'] = CURRENT_DIESEL * modal_price
-    
-    input_dict['Market_Mean_Price'] = price_stats.get('Market_Mean_Price', modal_price)
-    input_dict['Rolling_Mean_Price_4w'] = price_stats.get('Rolling_Mean_Price_4w', modal_price)
-    input_dict['Rolling_Std_Price_4w'] = price_stats.get('Rolling_Std_Price_4w', modal_price * 0.05)
-
-    input_df = pd.DataFrame(0.0, index=[0], columns=required_features)
-    for col, val in input_dict.items():
-        if col in input_df.columns:
-            if pd.isna(val): val = 0.0
-            input_df[col] = val
-            
-    return input_df
+def get_seasonal_averages(crop):
+    filename = f"{crop.lower()}_market_lagged_features.csv"
+    defaults = {'Modal_Price': 2500.0}
+    if os.path.exists(filename):
+        try:
+            df = pd.read_csv(filename)
+            return df.mean(numeric_only=True).to_dict()
+        except:
+            return defaults
+    return defaults
 
 def generate_price_trend(baseline, projected):
     trend = []
@@ -288,7 +225,92 @@ def generate_price_trend(baseline, projected):
         trend.append({"date": date_str, "price": price})
     return trend
 
-# --- 4. API ENDPOINTS ---
+# --- 4. AUTOMATED MONITORING SYSTEM ---
+
+def load_alerts():
+    if os.path.exists(ALERTS_FILE):
+        with open(ALERTS_FILE, 'r') as f: return json.load(f)
+    return []
+
+def save_alert(new_alert):
+    alerts = load_alerts()
+    new_alert['id'] = len(alerts) + 1
+    new_alert['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    alerts.insert(0, new_alert)
+    with open(ALERTS_FILE, 'w') as f: json.dump(alerts, f)
+    return new_alert
+
+def monitor_risks():
+    """Scheduled Job: Checks for SUDDEN price jumps compared to cached values."""
+    print("--- [SCHEDULER] Running Risk Monitor (24h Check) ---")
+    
+    if os.path.exists(RISK_CACHE_FILE):
+        with open(RISK_CACHE_FILE, 'r') as f: cache = json.load(f)
+    else:
+        cache = {}
+
+    # Check specific markets (Expand this list in production)
+    check_list = [("Onion", "pune"), ("Potato", "nashik"), ("Wheat", "mumbai")] 
+    
+    updated_cache = cache.copy()
+    
+    for crop, market in check_list:
+        if market not in MARKET_COORDS: continue
+        
+        lat = MARKET_COORDS[market]['latitude_x']
+        lon = MARKET_COORDS[market]['longitude_x']
+        model, scaler = load_model_and_scaler(crop)
+        if not model: continue
+        
+        weather, _ = fetch_weather_data(lat, lon) 
+        if weather.empty: continue
+        
+        hist = get_seasonal_averages(crop)
+        baseline = hist.get('Modal_Price', 2500)
+        
+        feats = model.get_booster().feature_names
+        inp = pd.DataFrame(0.0, index=[0], columns=feats)
+        for c in feats:
+            if "temperature" in c: inp[c] = weather['temperature_2m_max'].mean()
+            elif "precipitation" in c: inp[c] = weather['precipitation_sum'].sum()
+            elif "Price" in c: inp[c] = baseline
+            
+        try:
+            pred = float(model.predict(scaler.transform(inp))[0])
+            
+            cache_key = f"{crop}_{market}"
+            last_price = cache.get(cache_key, baseline)
+            
+            if last_price == 0: last_price = baseline # Prevent div by zero
+            
+            pct_change = ((pred - last_price) / last_price) * 100
+            
+            # Threshold: > 10% deviation
+            if abs(pct_change) > 10:
+                print(f"!!! ALERT TRIGGERED: {crop} in {market} changed by {pct_change:.1f}%")
+                
+                alert_obj = {
+                    "type": "Critical" if abs(pct_change) > 20 else "Warning",
+                    "crop": crop,
+                    "market": market,
+                    "message": f"Significant price shift detected! Changed from ₹{int(last_price)} to ₹{int(pred)}.",
+                    "change_pct": round(pct_change, 1),
+                    "is_sms_sent": True
+                }
+                save_alert(alert_obj)
+            
+            updated_cache[cache_key] = pred
+        except Exception as e:
+            print(f"Monitor Error for {crop}: {e}")
+
+    with open(RISK_CACHE_FILE, 'w') as f: json.dump(updated_cache, f)
+
+# Start Scheduler (Updated to 24 Hours)
+scheduler = BackgroundScheduler()
+scheduler.add_job(monitor_risks, 'interval', hours=24) 
+scheduler.start()
+
+# --- 5. API ENDPOINTS ---
 
 class AnalysisRequest(BaseModel):
     crop: str
@@ -314,110 +336,88 @@ def analyze_risk(req: AnalysisRequest):
     if req.market not in MARKET_COORDS:
         raise HTTPException(status_code=404, detail="Market coordinates not found.")
     
+    # Initialize variables to prevent UnboundLocalError
+    predicted_price = 0 
+    
     lat = MARKET_COORDS[req.market]['latitude_x']
     lon = MARKET_COORDS[req.market]['longitude_x']
     
     model, scaler = load_model_and_scaler(req.crop)
     if not model:
-        raise HTTPException(status_code=500, detail=f"Model for {req.crop} not found.")
+        raise HTTPException(status_code=500, detail=f"Model files for {req.crop} missing.")
 
-    weather_df, source = fetch_extended_weather(lat, lon)
+    # Unpack tuple (Data, Source)
+    weather_df, source = fetch_weather_data(lat, lon)
     
-    # FETCH REAL DATA
-    price_stats = fetch_agmarknet_data(req.crop, req.market)
-    if not price_stats:
-        print("Agmarknet failed/empty. Falling back to default.")
-        price_stats = {'Modal_Price': 2500.0} 
-    
-    baseline_price = price_stats.get('Modal_Price', 2500)
+    hist_data = get_seasonal_averages(req.crop)
     
     if weather_df.empty:
          raise HTTPException(status_code=503, detail="Weather data fetch failed.")
 
-    
-
     try:
-        input_data = prepare_input_vector(model, weather_df, price_stats)
+        # Prediction Logic
+        model_features = model.get_booster().feature_names
+        input_data = pd.DataFrame(0.0, index=[0], columns=model_features)
         
-        if scaler:
-            input_scaled = scaler.transform(input_data)
-            prediction = float(model.predict(input_scaled)[0])
-        else:
-            prediction = float(model.predict(input_data)[0])
-        
-        # Final Price Logic
-        if 'onion' in req.crop.strip().lower():
-             print(f"\n[DEBUG] {req.market} | Baseline: {baseline_price} | Diff: {prediction}")
-             predicted_price = baseline_price + prediction
-             print(f"[DEBUG] Final: {predicted_price}\n")
-        else:
-             predicted_price = prediction
+        current_temp = weather_df['temperature_2m_max'].mean()
+        current_rain = weather_df['precipitation_sum'].sum()
+        baseline_price = hist_data.get('Modal_Price', 2500)
 
-        if math.isnan(predicted_price) or math.isinf(predicted_price):
-            predicted_price = float(baseline_price)
+        # FIX: Check 'col' not 'c'
+        for col in model_features:
+            if "temperature" in col: input_data[col] = current_temp
+            elif "precipitation" in col: input_data[col] = current_rain
+            elif "Price" in col: input_data[col] = baseline_price
             
-        # Percentage Change
+        X_scaled = scaler.transform(input_data)
+        predicted_price = float(model.predict(X_scaled)[0])
+        
+        # Risk Logic
         pct_change = ((predicted_price - baseline_price) / baseline_price) * 100
+        risk_score = min(max((pct_change + 10) * 2.5, 0), 100)
         
-        # --- NEW RISK LOGIC (INVERTED) ---
-        # Price RISE (+) = High Risk (Supply Stress)
-        # Price DROP (-) = Low Risk (Good Supply)
-        
-        if pct_change > 0:
-            # RISING PRICES -> HIGH RISK
-            # Scale: +20% rise => Risk Score 50
-            risk_score = min(pct_change * 2.5, 100)
-            
-            if risk_score > 60:
-                risk_level = "HIGH RISK"
-                msg = f"Price surge of {pct_change:.1f}% predicted! Crop shortage likely."
-                adv_color = "error"
-                adv_title = "Critical Supply Alert"
-                adv_steps = ["Secure stock immediately", "Check for pest outbreaks"]
-            elif risk_score > 20:
-                risk_level = "MODERATE RISK"
-                msg = f"Price rising by {pct_change:.1f}%. Moderate stress."
-                adv_color = "warning"
-                adv_title = "Inflationary Trend"
-                adv_steps = ["Monitor daily rates", "Prepare for volatility"]
-            else:
-                risk_level = "LOW RISK"
-                msg = "Slight price increase. Stable market."
-                adv_color = "success"
-                adv_title = "Stable Conditions"
-                adv_steps = ["Standard operations"]
+        if risk_score > 60:
+            risk_level = "HIGH RISK"
+            msg = "High volatility predicted due to weather conditions."
+            adv_color = "error"
+            adv_title = "Critical Advisory"
+            adv_steps = ["Delay Planting", "Check Drainage"]
+        elif risk_score > 30:
+            risk_level = "MODERATE RISK"
+            msg = "Moderate deviation from historical norms."
+            adv_color = "warning"
+            adv_title = "Cautionary Advisory"
+            adv_steps = ["Monitor irrigation", "Watch for pests"]
         else:
-            # DROPPING PRICES -> LOW RISK (for crop stability)
-            risk_score = 10 # Base low score
             risk_level = "LOW RISK"
-            msg = f"Price dropping by {abs(pct_change):.1f}%. Good supply expected."
+            msg = "Conditions look stable and favorable."
             adv_color = "success"
-            adv_title = "Favorable Harvest"
-            adv_steps = ["Plan for storage", "Expect good availability"]
+            adv_title = "Favorable Conditions"
+            adv_steps = ["Proceed with standard care", "Maximize yield"]
 
-        timeline_data = []
-        if not weather_df.empty:
-            today = pd.Timestamp(date.today())
-            start_date = today
-            end_date = today + timedelta(days=6) 
-            mask = (weather_df.index >= start_date) & (weather_df.index <= end_date)
-            timeline_slice = weather_df.loc[mask]
-            timeline_data = timeline_slice.reset_index().replace({np.nan: None}).to_dict('records')
+        advisory = {
+            "title": adv_title, "body": msg, "steps": adv_steps, "color": adv_color
+        }
 
+        # 5-Day Timeline Logic
+        today = pd.Timestamp(date.today())
+        start_date = today - timedelta(days=2)
+        end_date = today + timedelta(days=2)
+        timeline_slice = weather_df.loc[start_date:end_date]
+        timeline_data = timeline_slice.reset_index().to_dict('records')
+
+        # Graph Data Logic
         price_trend = generate_price_trend(baseline_price, predicted_price)
-        target_date = (date.today() + timedelta(days=7)).strftime("%b %d")
 
         return {
             "projected_price": int(predicted_price),
-            "baseline_price": int(baseline_price),
-            "target_date": target_date,
             "historical_norm": int(baseline_price),
             "risk_level": risk_level,
             "risk_score": int(risk_score),
             "price_change": round(pct_change, 2),
             "weather_source": source,
             "message": msg,
-            "advisory": { "title": adv_title, "body": msg, "steps": adv_steps, "color": adv_color },
+            "advisory": advisory,
             "timeline": timeline_data,
             "price_trend": price_trend
         }
@@ -426,10 +426,3 @@ def analyze_risk(req: AnalysisRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Prediction Error: {str(e)}")
-
-def monitor_risks():
-    pass 
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(monitor_risks, 'interval', hours=24) 
-scheduler.start()
